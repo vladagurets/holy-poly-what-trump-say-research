@@ -1,0 +1,14 @@
+[Unit]
+Description=Holy-poly-what-trump-say-research: report Trump-say Polymarket research to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=REPLACE_USER
+Group=REPLACE_GROUP
+WorkingDirectory=REPLACE_PROJECT_DIR
+EnvironmentFile=REPLACE_PROJECT_DIR/.env
+ExecStart=/usr/bin/env python3 REPLACE_PROJECT_DIR/poly_trump_say_report.py
+StandardOutput=journal
+StandardError=journal
