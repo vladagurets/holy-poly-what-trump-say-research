@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install systemd timer to run main.py every hour.
+# Install systemd timer to run main.py every 10 minutes.
 # Usage: ./install-systemd-timer.sh [PROJECT_DIR]
 #   PROJECT_DIR defaults to the directory containing this script.
 # Requires: sudo (to install under /etc/systemd/system and enable timer).
