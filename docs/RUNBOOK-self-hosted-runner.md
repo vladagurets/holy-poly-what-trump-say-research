@@ -36,9 +36,18 @@ If the repo path will be different, adjust the path in the sudoers line. Runner 
 ```bash
 su - runner
 cd /home/runner/apps
-git clone https://github.com/vladagurets/holy-poly-what-trump-say-research.git
+git clone https://github.com/YOUR_USER/holy-poly-what-trump-say-research.git
 cd holy-poly-what-trump-say-research
 ```
+
+**Use SSH for `git pull` in the workflow** (HTTPS would prompt for credentials and fail in CI). As `runner`:
+
+1. Generate an SSH key if you don't have one:  
+   `ssh-keygen -t ed25519 -C "runner" -f ~/.ssh/id_ed25519 -N ""`
+2. Add the public key to GitHub: Repo → **Settings** → **Deploy keys** → **Add deploy key**. Title e.g. `runner`, paste contents of `cat ~/.ssh/id_ed25519.pub`. Read-only is enough.
+3. Switch the remote to SSH:  
+   `git remote set-url origin git@github.com:YOUR_USER/holy-poly-what-trump-say-research.git`  
+   Then test: `git pull --ff-only`.
 
 Create `.env` (e.g. copy from `.env.example`) and set at least:
 
