@@ -12,6 +12,9 @@ jobs:
     runs-on: self-hosted
     steps:
       - name: Pull and install timer
+        env:
+          HOME: /home/runner
+          GIT_SSH_COMMAND: "ssh -i /home/runner/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
         run: |
           git config --global --add safe.directory "${{ secrets.DEPLOY_PATH }}"
           cd "${{ secrets.DEPLOY_PATH }}"
