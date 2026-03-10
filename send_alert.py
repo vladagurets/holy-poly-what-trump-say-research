@@ -99,7 +99,7 @@ def build_report_message(
     prev = _parse_previous_counters(last_message or "")
     title = data.get("event_title") or slug
     event_url = data.get("event_url") or ""
-    lines = [f'<a href="{event_url}">11111</a>'] if event_url else [_html_escape(title)]
+    lines = [f'<a href="{event_url}">{_html_escape(title)}</a>'] if event_url else [_html_escape(title)]
     for kw in data.get("keywords") or []:
         if not isinstance(kw, dict):
             continue
