@@ -13,6 +13,9 @@ from typing import Any, Dict
 
 from fetch_events import event_state_path, load_event_state, save_event_state
 
+FACTBASE_TRANSCRIPT_BASE = "https://rollcall.com/factbase/trump/transcript"
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
 
 def _http_post_form(url: str, form: Dict[str, str], timeout: int = 30) -> Any:
     data = urllib.parse.urlencode(form).encode("utf-8")
@@ -56,14 +59,22 @@ def _parse_previous_counters(last_message: str) -> Dict[str, int]:
             continue
         key, val_str = rest.rsplit(": ", 1)
         key = _html_unescape(key.strip())
+        val_str = val_str.strip()
+        if " (" in val_str:
+            val_str = val_str.split(" (")[0].strip()
         try:
-            prev[key] = int(val_str.strip())
+            prev[key] = int(val_str)
         except ValueError:
             prev[key] = 0
     return prev
 
 
-def build_report_message(state_dir: str, slug: str, last_message: str | None = None) -> str:
+def build_report_message(
+    state_dir: str,
+    slug: str,
+    last_message: str | None = None,
+    max_refs: int | None = None,
+) -> str:
     path = event_state_path(state_dir, slug)
     data = load_event_state(path)
     if not data:
@@ -77,11 +88,34 @@ def build_report_message(state_dir: str, slug: str, last_message: str | None = N
             continue
         gt = kw.get("groupItemTitle", "")
         cnt = kw.get("counter", 0)
+        refs: list = kw.get("transcript_refs") or []
         prev_cnt = prev.get(gt) if gt in prev else None
         added_or_changed = prev_cnt is None or prev_cnt != cnt
         prefix = "🟢 " if added_or_changed else ""
-        lines.append(f"- {prefix}{_html_escape(str(gt))}: {cnt}")
+        line = f"- {prefix}{_html_escape(str(gt))}: {cnt}"
+        if refs and (max_refs is None or max_refs > 0):
+            show = refs if max_refs is None else refs[:max_refs]
+            links = []
+            for i, fb_slug in enumerate(show, 1):
+                url = f"{FACTBASE_TRANSCRIPT_BASE}/{fb_slug}/"
+                links.append(f'<a href="{url}">{i}</a>')
+            suffix = ", ".join(links)
+            if max_refs is not None and len(refs) > max_refs:
+                suffix += f", +{len(refs) - max_refs} more"
+            line += " (" + suffix + ")"
+        lines.append(line)
     return "\n".join(lines)
+
+
+def _truncate_message_to_telegram_limit(state_dir: str, slug: str, message: str, last_message: str | None) -> str:
+    """If message exceeds Telegram limit, rebuild with fewer transcript links per keyword."""
+    if len(message) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        return message
+    for max_refs in (15, 10, 5, 3, 1, 0):
+        truncated = build_report_message(state_dir, slug, last_message=last_message, max_refs=max_refs)
+        if len(truncated) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+            return truncated
+    return build_report_message(state_dir, slug, last_message=last_message, max_refs=0)
 
 
 def send_telegram_message(token: str, chat_id: str, text: str, dry_run: bool = False) -> None:
@@ -125,6 +159,7 @@ def run(state_dir: str, token: str, chat_id: str, dry_run: bool = False, active_
             continue
         last_message = (data.get("last_report_message") or "").strip()
         new_message = build_report_message(state_dir, slug, last_message=last_message)
+        new_message = _truncate_message_to_telegram_limit(state_dir, slug, new_message, last_message)
         if not new_message.strip():
             continue
         new_message_plain = "\n".join(

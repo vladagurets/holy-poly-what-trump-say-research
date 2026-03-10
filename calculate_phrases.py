@@ -23,9 +23,14 @@ def _load_facts_index(state_dir: str) -> Dict[str, Dict[str, str]]:
 
 
 def _count_phrase_in_text(phrase: str, text: str) -> int:
+    """Count occurrences of phrase as whole words only (word-boundary match). E.g. 'Hat' does not match 'that'; 'N Word' does not match 'golden words'."""
     if not phrase or not text:
         return 0
-    return len(re.findall(re.escape(phrase), text, re.IGNORECASE))
+    words = phrase.split()
+    if not words:
+        return 0
+    pattern = r"\b" + r"\b\s+\b".join(re.escape(w) for w in words) + r"\b"
+    return len(re.findall(pattern, text, re.IGNORECASE))
 
 
 def run(state_dir: str) -> None:
@@ -59,9 +64,8 @@ def run(state_dir: str) -> None:
         end = (tw.get("end_date") or "").strip()[:10]
         if len(start) < 10 or len(end) < 10 or start > end:
             continue
-        parts: List[str] = []
-        used_slugs: List[str] = []
-        for fb_slug, meta in index.items():
+        transcript_pairs: List[tuple[str, str]] = []
+        for fb_slug, meta in sorted(index.items()):
             if not isinstance(meta, dict):
                 continue
             d = (meta.get("date") or "").strip()[:10]
@@ -70,12 +74,9 @@ def run(state_dir: str) -> None:
             txt_path = os.path.join(facts_dir, "transcripts", f"{fb_slug}.txt")
             try:
                 with open(txt_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    parts.append(content)
-                    used_slugs.append(fb_slug)
+                    transcript_pairs.append((fb_slug, f.read()))
             except OSError:
                 continue
-        text = "\n\n".join(parts)
         keywords = data.get("keywords")
         if not isinstance(keywords, list):
             continue
@@ -85,13 +86,16 @@ def run(state_dir: str) -> None:
             phrases = kw.get("phrases")
             if not isinstance(phrases, list):
                 continue
-            total = sum(
-                _count_phrase_in_text(p, text)
-                for p in phrases
-                if isinstance(p, str)
-            )
-            kw["counter"] = total
+            refs: List[str] = []
+            for fb_slug, text in transcript_pairs:
+                for p in phrases:
+                    if not isinstance(p, str):
+                        continue
+                    n = _count_phrase_in_text(p, text)
+                    refs.extend([fb_slug] * n)
+            kw["counter"] = len(refs)
+            kw["transcript_refs"] = refs
         save_event_state(path, data)
         updated += 1
-        print(f"[calculate_phrases] Updated {slug}: {len(used_slugs)} transcript(s), {len(text)} chars.", file=sys.stderr)
+        print(f"[calculate_phrases] Updated {slug}: {len(transcript_pairs)} transcript(s).", file=sys.stderr)
     print(f"[calculate_phrases] Done: {updated} event(s) updated.", file=sys.stderr)
