@@ -1,50 +1,18 @@
 #!/usr/bin/env python3
-"""poly-what-trump-say-research: reporter for "What will Trump say" Polymarket events.
-
-Fetches active events from Gamma API with tag_id=126 (Trump), filters by title
-"What will Trump say", keeps per-event state (keywords from groupItemTitle,
-counters), and posts a single Telegram report only when the report message changes.
-
-Env vars:
-  TELEGRAM_BOT_TOKEN   required
-  TELEGRAM_CHAT_ID     required
-  STATE_DIR            default ./state
-  LIMIT                default 500 (events per page)
-  DEBUG                default 0
-  DRY_RUN              default 0
-"""
+"""Orchestrate pipeline: fetch events, factbase, extract transcripts, calculate phrases, send alert."""
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List
 
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-EVENT_BASE = "https://polymarket.com/event/"
-TRUMP_SAY_TITLE = "What will Trump say"
-TRUMP_TAG_ID = "126"  # Gamma tag slug "trump"
-LAST_MESSAGE_FILENAME = "last_report_message.txt"
+from calculate_phrases import run as run_calculate_phrases
+from extract_factbase_transcripts import run_extract
+from fetch_events import run as run_fetch_events
+from fetch_factbase_events import run_fetch
+from send_alert import run as run_send_alert
 
 BOOL_TRUE_VALUES = ("1", "true", "yes", "y", "on")
-
-
-@dataclass
-class Config:
-    token: str
-    chat_id: str
-    limit: int
-    state_dir: str
-    debug: bool
-    dry_run: bool
 
 
 def _parse_bool_env(name: str, default: str = "0") -> bool:
@@ -59,377 +27,51 @@ def getenv_required(name: str) -> str:
     return v
 
 
-def load_config() -> Config:
-    token = getenv_required("TELEGRAM_BOT_TOKEN")
-    chat_id = getenv_required("TELEGRAM_CHAT_ID")
+def load_config() -> dict:
     state_dir = os.getenv("STATE_DIR", os.path.join(os.path.dirname(__file__), "state"))
     limit = int(os.getenv("LIMIT", "500"))
-    debug = _parse_bool_env("DEBUG")
-    dry_run = _parse_bool_env("DRY_RUN")
     if limit <= 0:
         raise RuntimeError("LIMIT must be > 0")
-    return Config(token=token, chat_id=chat_id, limit=limit, state_dir=state_dir, debug=debug, dry_run=dry_run)
-
-
-def http_get_json(url: str, headers: Dict[str, str] | None = None, timeout: int = 30) -> Any:
-    req = urllib.request.Request(
-        url,
-        headers=headers or {"accept": "application/json", "user-agent": "poly-trump-say-report/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def http_post_form(url: str, form: Dict[str, str], timeout: int = 30) -> Any:
-    data = urllib.parse.urlencode(form).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"content-type": "application/x-www-form-urlencoded", "user-agent": "poly-trump-say-report/1.0"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(f"HTTP {e.code} {e.reason} for {url} :: {body[:500]}") from e
-
-
-def parse_group_item_title(title: str) -> tuple[List[str], int | None]:
-    """Parse groupItemTitle into phrases list and optional min_times rule.
-
-    - Strip trailing " N+ times" (e.g. "7+ times", "27+ times"); capture N as min_times.
-    - Split remainder by " / ", strip each segment -> phrases.
-    """
-    if not title or not isinstance(title, str):
-        return [], None
-    s = title.strip()
-    min_times: int | None = None
-    m = re.search(r"\s+(\d+)\+\s*times\s*$", s)
-    if m:
-        min_times = int(m.group(1))
-        s = s[: m.start()].strip()
-    phrases = [p.strip() for p in s.split(" / ") if p.strip()]
-    return phrases, min_times
-
-
-def _extract_keywords_from_event(event: Dict[str, Any]) -> List[str]:
-    out: List[str] = []
-    markets = event.get("markets")
-    if not isinstance(markets, list):
-        return out
-    for m in markets:
-        if not isinstance(m, dict):
-            continue
-        if m.get("closed") is True:
-            continue
-        title = m.get("groupItemTitle")
-        if isinstance(title, str) and title.strip():
-            out.append(title.strip())
-    return out
-
-
-def _iso_to_date(iso: Any) -> str | None:
-    """Extract YYYY-MM-DD from an ISO 8601 string, or return None."""
-    if not iso or not isinstance(iso, str):
-        return None
-    s = iso.strip()
-    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-        return s[:10]
-    return None
-
-
-def _market_has_dispute(m: Dict[str, Any]) -> bool:
-    """True if market has at least one 'disputed' in umaResolutionStatuses (UMA dispute).
-
-    Gamma may return umaResolutionStatuses as a list or other scalar; count
-    case-insensitive 'disputed' tokens (same logic as poly-dispute-research).
-    """
-    raw = m.get("umaResolutionStatuses")
-    if isinstance(raw, list):
-        disputed_count = sum(
-            1 for x in raw if isinstance(x, str) and x.strip().lower() == "disputed"
-        )
-        return disputed_count >= 1
-    s = str(raw or "")
-    return len(re.findall(r"\bdisputed\b", s, flags=re.IGNORECASE)) >= 1
-
-
-def _event_has_any_dispute(ev: Dict[str, Any]) -> bool:
-    """True if any market in the event has a UMA dispute."""
-    markets = ev.get("markets")
-    if not isinstance(markets, list):
-        return False
-    for m in markets:
-        if isinstance(m, dict) and _market_has_dispute(m):
-            return True
-    return False
-
-
-def _is_visit_based_event(slug: str) -> bool:
-    """True if event is tied to a specific visit (e.g. Kentucky, TrumpRX Ohio), not a time window."""
-    s = slug.lower()
-    return "during" in s and "visit" in s
-
-
-def fetch_all_trump_say_events(cfg: Config) -> List[Dict[str, Any]]:
-    needle = TRUMP_SAY_TITLE.lower()
-    out: List[Dict[str, Any]] = []
-    offset = 0
-
-    while True:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "tag_id": TRUMP_TAG_ID,
-            "limit": str(cfg.limit),
-            "offset": str(offset),
-        }
-        url = f"{GAMMA_BASE}/events?{urllib.parse.urlencode(params)}"
-        page = http_get_json(url)
-        if not isinstance(page, list):
-            raise RuntimeError("Gamma /events returned non-list")
-        if not page:
-            break
-
-        for ev in page:
-            if not isinstance(ev, dict):
-                continue
-            title = ev.get("title")
-            if not isinstance(title, str) or needle not in title.lower():
-                continue
-            slug = ev.get("slug")
-            if not isinstance(slug, str) or not slug.strip():
-                continue
-            if _is_visit_based_event(slug):
-                continue
-            if _event_has_any_dispute(ev):
-                continue
-            event_url = EVENT_BASE + slug.strip()
-            event_title = title.strip()
-            keywords = _extract_keywords_from_event(ev)
-            out.append({
-                "slug": slug.strip(),
-                "event_url": event_url,
-                "event_title": event_title,
-                "keywords": keywords,
-                "startDate": ev.get("startDate"),
-                "endDate": ev.get("endDate"),
-            })
-
-        if len(page) < cfg.limit:
-            break
-        offset += cfg.limit
-
-    return out
-
-
-def _event_state_path(cfg: Config, slug: str) -> str:
-    return os.path.join(cfg.state_dir, f"{slug}.json")
-
-
-def _last_message_path(cfg: Config) -> str:
-    return os.path.join(cfg.state_dir, LAST_MESSAGE_FILENAME)
-
-
-def load_event_state(path: str) -> Dict[str, Any] | None:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict) or "keywords" not in data:
-            return None
-        for kw in data.get("keywords") or []:
-            if not isinstance(kw, dict):
-                continue
-            if "phrases" not in kw and isinstance(kw.get("groupItemTitle"), str):
-                phrases, min_times = parse_group_item_title(kw["groupItemTitle"])
-                kw["phrases"] = phrases
-                kw["min_times"] = min_times
-        return data
-    except FileNotFoundError:
-        return None
-
-
-def atomic_write_json(path: str, data: Any) -> None:
-    tmp = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
-
-
-def save_event_state(path: str, data: Dict[str, Any]) -> None:
-    data["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    atomic_write_json(path, data)
-
-
-def merge_event_state(existing: Dict[str, Any] | None, event: Dict[str, Any]) -> Dict[str, Any]:
-    old_keywords = []
-    if existing and isinstance(existing.get("keywords"), list):
-        for kw in existing["keywords"]:
-            if isinstance(kw, dict) and isinstance(kw.get("groupItemTitle"), str):
-                old_keywords.append((kw["groupItemTitle"], int(kw.get("counter") or 0)))
-    old_map = dict(old_keywords)
-
-    keywords: List[Dict[str, Any]] = []
-    for title in event["keywords"]:
-        phrases, min_times = parse_group_item_title(title)
-        kw: Dict[str, Any] = {
-            "groupItemTitle": title,
-            "phrases": phrases,
-            "counter": old_map.get(title, 0),
-        }
-        if min_times is not None:
-            kw["min_times"] = min_times
-        else:
-            kw["min_times"] = None
-        keywords.append(kw)
-
-    start_date = _iso_to_date(event.get("startDate"))
-    end_date = _iso_to_date(event.get("endDate"))
-    time_window: Dict[str, Any] = {}
-    if start_date is not None:
-        time_window["start_date"] = start_date
-    if end_date is not None:
-        time_window["end_date"] = end_date
-
-    out: Dict[str, Any] = {
-        "event_url": event["event_url"],
-        "event_title": event["event_title"],
-        "keywords": keywords,
-        "last_updated": "",  # set by save_event_state
+    return {
+        "state_dir": state_dir,
+        "limit": limit,
+        "token": getenv_required("TELEGRAM_BOT_TOKEN"),
+        "chat_id": getenv_required("TELEGRAM_CHAT_ID"),
+        "dry_run": _parse_bool_env("DRY_RUN"),
+        "debug": _parse_bool_env("DEBUG"),
     }
-    if time_window:
-        out["time_window"] = time_window
-    return out
-
-
-def cleanup_stale_state_files(cfg: Config, active_slugs: set[str]) -> None:
-    os.makedirs(cfg.state_dir, exist_ok=True)
-    try:
-        names = os.listdir(cfg.state_dir)
-    except FileNotFoundError:
-        return
-    for name in names:
-        if name == LAST_MESSAGE_FILENAME or not name.endswith(".json"):
-            continue
-        slug = name[:-5]
-        if slug not in active_slugs:
-            path = os.path.join(cfg.state_dir, name)
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def load_last_message(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return ""
-
-
-def atomic_write_text(path: str, text: str) -> None:
-    tmp = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-
-
-def html_escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def build_report_message_for_event(cfg: Config, slug: str) -> str:
-    path = _event_state_path(cfg, slug)
-    data = load_event_state(path)
-    if not data:
-        return ""
-    title = data.get("event_title") or slug
-    event_url = data.get("event_url") or ""
-    if event_url:
-        lines = [f'<a href="{event_url}">{html_escape(title)}</a>']
-    else:
-        lines = [html_escape(title)]
-    for kw in data.get("keywords") or []:
-        if isinstance(kw, dict):
-            gt = kw.get("groupItemTitle", "")
-            cnt = kw.get("counter", 0)
-            lines.append(f"- {html_escape(str(gt))}: {cnt}")
-    return "\n".join(lines)
-
-
-def telegram_send_message(cfg: Config, text: str) -> None:
-    if cfg.dry_run:
-        print("\n--- MESSAGE (dry-run) ---\n")
-        print(text)
-        print("\n--- /MESSAGE (dry-run) ---\n")
-        return
-    url = f"https://api.telegram.org/bot{cfg.token}/sendMessage"
-    payload = {
-        "chat_id": cfg.chat_id,
-        "text": text,
-        "disable_web_page_preview": "true",
-        "parse_mode": "HTML",
-    }
-    r = http_post_form(url, payload)
-    if not (isinstance(r, dict) and r.get("ok") is True):
-        raise RuntimeError(f"Telegram send failed: {r}")
 
 
 def main() -> int:
     cfg = load_config()
 
-    events = fetch_all_trump_say_events(cfg)
-    active_slugs = {e["slug"] for e in events}
-
-    if cfg.debug:
-        print(f"[dbg] fetched {len(events)} events, slugs: {sorted(active_slugs)}")
-
-    for ev in events:
-        path = _event_state_path(cfg, ev["slug"])
-        existing = load_event_state(path)
-        merged = merge_event_state(existing, ev)
-        save_event_state(path, merged)
-
-    cleanup_stale_state_files(cfg, active_slugs)
-
+    print("[main] Step 1/5: Fetch Polymarket events and state...", file=sys.stderr)
+    active_slugs = run_fetch_events(cfg["state_dir"], limit=cfg["limit"])
     if not active_slugs:
         print("[ok] no active events; state cleaned")
         return 0
 
-    sent = 0
-    for slug in sorted(active_slugs):
-        path = _event_state_path(cfg, slug)
-        data = load_event_state(path)
-        if not data:
-            continue
-        new_message = build_report_message_for_event(cfg, slug)
-        if not new_message.strip():
-            continue
-        last_message = (data.get("last_report_message") or "").strip()
-        if new_message.strip() != last_message:
-            telegram_send_message(cfg, new_message)
-            if not cfg.dry_run:
-                data["last_report_message"] = new_message
-                save_event_state(path, data)
-                print(f"[ok] sent and saved state for {slug}")
-            else:
-                print(f"[ok] would send for {slug} (dry-run; state not saved)")
-            sent += 1
-            time.sleep(0.4)
+    print("[main] Step 2/5: Fetch Factbase video events...", file=sys.stderr)
+    run_fetch(cfg["state_dir"])
+
+    print("[main] Step 3/5: Extract Donald Trump transcripts...", file=sys.stderr)
+    run_extract(cfg["state_dir"])
+
+    print("[main] Step 4/5: Calculate phrase counters from transcripts...", file=sys.stderr)
+    run_calculate_phrases(cfg["state_dir"])
+
+    print("[main] Step 5/5: Send Telegram alerts...", file=sys.stderr)
+    sent = run_send_alert(
+        cfg["state_dir"],
+        token=cfg["token"],
+        chat_id=cfg["chat_id"],
+        dry_run=cfg["dry_run"],
+        active_slugs=active_slugs,
+    )
     if sent:
         print(f"[ok] total: {sent} event report(s)")
     else:
         print("[ok] no change in any report; not sent")
-
     return 0
 
 
