@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Install systemd timer to run main.py every 10 minutes.
 # Usage: ./install-systemd-timer.sh [PROJECT_DIR]
 #   PROJECT_DIR defaults to the directory containing this script.
@@ -6,15 +6,15 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="${1:-$SCRIPT_DIR}"
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 
-if [[ ! -f "$PROJECT_DIR/main.py" ]]; then
+if [ ! -f "$PROJECT_DIR/main.py" ]; then
   echo "Error: main.py not found in $PROJECT_DIR" >&2
   exit 1
 fi
-if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+if [ ! -f "$PROJECT_DIR/.env" ]; then
   echo "Error: .env not found in $PROJECT_DIR" >&2
   exit 1
 fi
@@ -29,11 +29,17 @@ TIMER_SRC="$UNITS_DIR/holy-poly-what-trump-say-research.timer"
 DEST_DIR="/etc/systemd/system"
 
 for f in "$SERVICE_SRC" "$TIMER_SRC"; do
-  if [[ ! -f "$f" ]]; then
+  if [ ! -f "$f" ]; then
     echo "Error: $f not found" >&2
     exit 1
   fi
 done
+
+# First step: stop and remove any existing installation
+sudo systemctl stop holy-poly-what-trump-say-research.timer 2>/dev/null || true
+sudo systemctl disable holy-poly-what-trump-say-research.timer 2>/dev/null || true
+sudo rm -f "$DEST_DIR/holy-poly-what-trump-say-research.service" "$DEST_DIR/holy-poly-what-trump-say-research.timer"
+sudo systemctl daemon-reload
 
 echo "Project dir: $PROJECT_DIR"
 echo "Run as user: $RUN_USER ($RUN_GROUP)"
