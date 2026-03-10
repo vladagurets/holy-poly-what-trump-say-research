@@ -140,9 +140,9 @@ Short checklist:
 1. **Add a repo secret**  
    Repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**  
    Name: `DEPLOY_PATH`  
-   Value: `/home/runner/apps/holy-poly-what-trump-say-research` (if you follow the runbook).
+   Value: `/root/apps/holy-poly-what-trump-say-research` (root deploy).
 
-2. **Install the runner and app** — follow [docs/RUNBOOK-self-hosted-runner.md](docs/RUNBOOK-self-hosted-runner.md) (user `runner`, app in `/home/runner/apps/...`, no root for runner).
+2. **Install the runner and app** — install the self-hosted runner as **root**; put the app in `/root/apps/holy-poly-what-trump-say-research`; add root's SSH public key as a deploy key so `git pull` works in the workflow.
 
 3. **Workflow** — `.github/workflows/deploy-on-push.yml` runs on push to `main`; it `cd`'s into `DEPLOY_PATH`, runs `git pull --ff-only` and `./install-systemd-timer.sh`. Change `branches: [main]` in the workflow if your default branch is different.
 
