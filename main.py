@@ -143,6 +143,33 @@ def _iso_to_date(iso: Any) -> str | None:
     return None
 
 
+def _market_has_dispute(m: Dict[str, Any]) -> bool:
+    """True if market has at least one 'disputed' in umaResolutionStatuses (UMA dispute).
+
+    Gamma may return umaResolutionStatuses as a list or other scalar; count
+    case-insensitive 'disputed' tokens (same logic as poly-dispute-research).
+    """
+    raw = m.get("umaResolutionStatuses")
+    if isinstance(raw, list):
+        disputed_count = sum(
+            1 for x in raw if isinstance(x, str) and x.strip().lower() == "disputed"
+        )
+        return disputed_count >= 1
+    s = str(raw or "")
+    return len(re.findall(r"\bdisputed\b", s, flags=re.IGNORECASE)) >= 1
+
+
+def _event_has_any_dispute(ev: Dict[str, Any]) -> bool:
+    """True if any market in the event has a UMA dispute."""
+    markets = ev.get("markets")
+    if not isinstance(markets, list):
+        return False
+    for m in markets:
+        if isinstance(m, dict) and _market_has_dispute(m):
+            return True
+    return False
+
+
 def _is_visit_based_event(slug: str) -> bool:
     """True if event is tied to a specific visit (e.g. Kentucky, TrumpRX Ohio), not a time window."""
     s = slug.lower()
@@ -179,6 +206,8 @@ def fetch_all_trump_say_events(cfg: Config) -> List[Dict[str, Any]]:
             if not isinstance(slug, str) or not slug.strip():
                 continue
             if _is_visit_based_event(slug):
+                continue
+            if _event_has_any_dispute(ev):
                 continue
             event_url = EVENT_BASE + slug.strip()
             event_title = title.strip()
