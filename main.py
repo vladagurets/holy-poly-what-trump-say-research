@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -97,6 +99,24 @@ def http_post_form(url: str, form: Dict[str, str], timeout: int = 30) -> Any:
         raise RuntimeError(f"HTTP {e.code} {e.reason} for {url} :: {body[:500]}") from e
 
 
+def parse_group_item_title(title: str) -> tuple[List[str], int | None]:
+    """Parse groupItemTitle into phrases list and optional min_times rule.
+
+    - Strip trailing " N+ times" (e.g. "7+ times", "27+ times"); capture N as min_times.
+    - Split remainder by " / ", strip each segment -> phrases.
+    """
+    if not title or not isinstance(title, str):
+        return [], None
+    s = title.strip()
+    min_times: int | None = None
+    m = re.search(r"\s+(\d+)\+\s*times\s*$", s)
+    if m:
+        min_times = int(m.group(1))
+        s = s[: m.start()].strip()
+    phrases = [p.strip() for p in s.split(" / ") if p.strip()]
+    return phrases, min_times
+
+
 def _extract_keywords_from_event(event: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     markets = event.get("markets")
@@ -171,9 +191,16 @@ def load_event_state(path: str) -> Dict[str, Any] | None:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and "keywords" in data:
-            return data
-        return None
+        if not isinstance(data, dict) or "keywords" not in data:
+            return None
+        for kw in data.get("keywords") or []:
+            if not isinstance(kw, dict):
+                continue
+            if "phrases" not in kw and isinstance(kw.get("groupItemTitle"), str):
+                phrases, min_times = parse_group_item_title(kw["groupItemTitle"])
+                kw["phrases"] = phrases
+                kw["min_times"] = min_times
+        return data
     except FileNotFoundError:
         return None
 
@@ -202,7 +229,17 @@ def merge_event_state(existing: Dict[str, Any] | None, event: Dict[str, Any]) ->
 
     keywords: List[Dict[str, Any]] = []
     for title in event["keywords"]:
-        keywords.append({"groupItemTitle": title, "counter": old_map.get(title, 0)})
+        phrases, min_times = parse_group_item_title(title)
+        kw: Dict[str, Any] = {
+            "groupItemTitle": title,
+            "phrases": phrases,
+            "counter": old_map.get(title, 0),
+        }
+        if min_times is not None:
+            kw["min_times"] = min_times
+        else:
+            kw["min_times"] = None
+        keywords.append(kw)
 
     return {
         "event_url": event["event_url"],
@@ -250,22 +287,23 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def build_report_message(cfg: Config, active_slugs: List[str]) -> str:
-    lines: List[str] = []
-    for slug in sorted(active_slugs):
-        path = _event_state_path(cfg, slug)
-        data = load_event_state(path)
-        if not data:
-            continue
-        title = data.get("event_title") or slug
-        lines.append(f"What did Trump say in {html_escape(title)}?")
-        for kw in data.get("keywords") or []:
-            if isinstance(kw, dict):
-                gt = kw.get("groupItemTitle", "")
-                cnt = kw.get("counter", 0)
-                lines.append(f"- {html_escape(str(gt))}: {cnt}")
-        lines.append("")
-    return "\n".join(lines).strip()
+def build_report_message_for_event(cfg: Config, slug: str) -> str:
+    path = _event_state_path(cfg, slug)
+    data = load_event_state(path)
+    if not data:
+        return ""
+    title = data.get("event_title") or slug
+    event_url = data.get("event_url") or ""
+    if event_url:
+        lines = [f'<a href="{event_url}">{html_escape(title)}</a>']
+    else:
+        lines = [html_escape(title)]
+    for kw in data.get("keywords") or []:
+        if isinstance(kw, dict):
+            gt = kw.get("groupItemTitle", "")
+            cnt = kw.get("counter", 0)
+            lines.append(f"- {html_escape(str(gt))}: {cnt}")
+    return "\n".join(lines)
 
 
 def telegram_send_message(cfg: Config, text: str) -> None:
@@ -304,26 +342,30 @@ def main() -> int:
     cleanup_stale_state_files(cfg, active_slugs)
 
     if not active_slugs:
-        last_path = _last_message_path(cfg)
-        if os.path.isfile(last_path):
-            try:
-                os.remove(last_path)
-            except OSError:
-                pass
         print("[ok] no active events; state cleaned")
         return 0
 
-    new_message = build_report_message(cfg, sorted(active_slugs))
-    last_path = _last_message_path(cfg)
-    last_message = load_last_message(last_path)
-
-    if new_message.strip() != last_message.strip():
-        telegram_send_message(cfg, new_message)
-        if not cfg.dry_run:
-            atomic_write_text(last_path, new_message)
-        print("[ok] report sent (message changed)")
+    sent = 0
+    for slug in sorted(active_slugs):
+        path = _event_state_path(cfg, slug)
+        data = load_event_state(path)
+        if not data:
+            continue
+        new_message = build_report_message_for_event(cfg, slug)
+        if not new_message.strip():
+            continue
+        last_message = (data.get("last_report_message") or "").strip()
+        if new_message.strip() != last_message:
+            telegram_send_message(cfg, new_message)
+            if not cfg.dry_run:
+                data["last_report_message"] = new_message
+                save_event_state(path, data)
+            sent += 1
+            time.sleep(0.4)
+    if sent:
+        print(f"[ok] sent {sent} event report(s)")
     else:
-        print("[ok] no change in report; not sent")
+        print("[ok] no change in any report; not sent")
 
     return 0
 
