@@ -13,6 +13,7 @@ jobs:
     steps:
       - name: Pull and install timer
         run: |
+          git config --global --add safe.directory "${{ secrets.DEPLOY_PATH }}"
           cd "${{ secrets.DEPLOY_PATH }}"
           git pull --ff-only
-          ./install-systemd-timer.sh
+          sudo ./install-systemd-timer.sh
