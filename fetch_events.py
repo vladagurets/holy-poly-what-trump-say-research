@@ -200,6 +200,9 @@ def _fetch_all_trump_say_events(state_dir: str, limit: int) -> List[Dict[str, An
                 full = _fetch_event_by_slug(slug.strip())
                 if isinstance(full, dict) and full.get("description"):
                     description = (full.get("description") or "").strip()
+            parsed_start, parsed_end = _parse_resolution_window_from_description(description)
+            if not parsed_start or not parsed_end:
+                continue
             out.append({
                 "slug": slug.strip(),
                 "event_url": EVENT_BASE + slug.strip(),
